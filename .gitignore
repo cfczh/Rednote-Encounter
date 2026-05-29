@@ -21,6 +21,10 @@ build/
 *.elf
 *.hex
 
+# --- Media (large demo assets) ---
+media/
+*.mp4
+
 # --- Editor / OS ---
 .vscode/
 .idea/
