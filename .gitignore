@@ -1,0 +1,27 @@
+# --- Secrets (NEVER commit) ---
+.env
+*.env
+**/.env
+
+# --- Python venv & cache ---
+.venv/
+**/.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# --- macOS archive junk ---
+__MACOSX/
+**/__MACOSX/
+.DS_Store
+
+# --- Arduino build artifacts ---
+build/
+*.bin
+*.elf
+*.hex
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+Thumbs.db
