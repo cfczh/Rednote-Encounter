@@ -475,6 +475,32 @@ def serial_virtual_peers(now: float) -> list[Peer]:
     return peers
 
 
+WS_PERSONA_IDS = {"xiao_hong": 1, "zhang_zong": 2}
+WS_DEVICE_IDS  = {"xiao_hong": 0xA003, "zhang_zong": 0xA007}
+
+
+def ws_virtual_peers(now: float) -> list[Peer]:
+    """板子通过 WiFi/WS 连上来就自动算作 active peer，不依赖 BLE 扫描。"""
+    peers = []
+    for persona in WS_BOARDS:
+        persona_id = WS_PERSONA_IDS.get(persona)
+        if not persona_id:
+            continue
+        peers.append(Peer(
+            address="",
+            name=f"WS-{persona}",
+            rssi=-40,
+            device_id=WS_DEVICE_IDS.get(persona, 0xA000 + persona_id),
+            persona_id=persona_id,
+            state=3,
+            gift_id=SERIAL_GIFT_IDS.get(persona, 0),
+            flags=0,
+            counter=0,
+            seen_at=now,
+        ))
+    return peers
+
+
 # ======================================================================
 # 4. WebSocket 服务器（板子 WiFi 通道 + dashboard 监控）
 #    板子连上来发 HELLO|<persona> 注册身份，之后收 TXT|/DUEL| 命令。
@@ -646,9 +672,14 @@ async def main() -> None:
         while True:
             now = time.time()
             active = [p for p in peers.values() if now - p.seen_at < PAIR_LOST_AFTER]
+            # 串口虚拟 peer
             if len(SERIAL_PORTS) >= 2:
                 seen_personas = {p.persona for p in active}
                 active.extend(p for p in serial_virtual_peers(now) if p.persona not in seen_personas)
+            # WS 虚拟 peer：板子连了 WiFi 就直接算在线
+            if WS_BOARDS:
+                seen_personas = {p.persona for p in active}
+                active.extend(p for p in ws_virtual_peers(now) if p.persona not in seen_personas)
             active.sort(key=lambda p: p.rssi, reverse=True)
 
             if now - last_status_brd > 2.0:
