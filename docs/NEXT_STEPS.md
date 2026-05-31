@@ -57,9 +57,10 @@
 
 > 自动续跑时：**只改代码/素材并本地提交，不要 git push，不要烧录硬件**——push 和 flash 留给真人确认。
 
-- [ ] **A. 修 gitlink**：确认 `persona-agent` 是否已被学姐修好；没修就在 NEXT_STEPS 里记一笔提醒，别自己乱动她的子模块。
-- [ ] **B. 后端串口桥**：基于 `zhang_agent_2/zhang-agent/`（已有 `m5_audio.py`/`voice.py`/`duel.py`/`scripts/list_serial_ports.py`）整理出一个能跑的串口桥：
-      列串口 → 连两台板子 → 按对话发 `TXT|state|text` 或 `DUEL|...` → TTS 生成 PCM 用 `PC2` 协议发给板子播。
+- [x] **A. 修 gitlink**：本地确认：`persona-agent` 目录不存在、git 索引里也无 gitlink（`git ls-files --stage | grep persona` 无结果）。本仓库本地分支无该问题。⚠️ 远端可能仍有空指针，需学姐在自己的机器按 §2 说明操作（删内嵌 .git → `git rm --cached` → 重新 add）。
+- [x] **B. 后端串口桥**：新增 `zhang_agent_2/zhang-agent/zhang_agent/serial_bridge.py`（M5SerialBridge 类，115200 baud，支持 `send_duel` / `send_txt` / `send_act`）；`duel.py` 新增 `display` 参数，对话时自动广播 `DUEL|zhang_zong|<other>|<speaker>|chat|<text>` 到两台板；`__main__.py` 新增 `--display` flag。
+      **启动命令示例**：`python -m zhang_agent duel --zhang-port COM7 --other-port COM3 --display`
+      ⏳ **PC2 音频**：固件 `cores3_encounter.ino` 不支持串口 PCM，待切换到 `animation.ino` 后再接（届时需修改 `m5_audio.py` 以使用 PC2 协议替代 ZAV1）。
 - [ ] **C. 状态统一**：把所有地方的状态名统一成 `idle/outdoor/meet/chat/leave`。更新 `docs/PROTOCOL.md`。
 - [ ] **D. 流程串通**：idle（待机）→ 蓝牙识别靠近 → outdoor（分屏出门）→ meet → chat（逐句对话+语音）→ leave（同屏离开）→ 回 idle。
 - [ ] **E. WebSocket**：现在串口模拟，之后把传输层换成 WebSocket（板子 WiFi 客户端 + 后端服务器）。BLE 仅用于测距触发。
@@ -111,3 +112,4 @@
   - 固件已临时兜底（commit 59c0611）：kMaxFrameBytes 提到 2MB + 帧缓冲改 ps_malloc 走 PSRAM，能解码大图——但 950KB 解码很慢，会拖慢主循环和 BLE 扫描（实测 18s 只跑 1 轮扫描）。**正解是缩图**。
   - 新增 `tools/shrink_frames.py`（commit 见下）：递归缩到 320x240、压 <120KB、**保留文件名/扩展名/子目录结构**，适合直接对 SD 卡上 `zhang_zong/animations` 整个目录跑。实测 boss 原图 893KB→27KB（约 1/31）。
   - **TODO（真人做）**：把 SD 卡上 zhang_zong（及任何超大）帧用该脚本缩小后替换回卡里，张总动画就会和小红一样流畅。命令：`C:\Users\fujisyuke\anaconda3\python.exe tools/shrink_frames.py <卡盘符>:\zhang_zong\animations`（默认输出到 `_small/`，确认后替换；或加 `--inplace` 就地覆盖会自动备份）。
+- 2026-05-31 续跑（自动）：✅A 任务：本地无 persona-agent gitlink 问题，记录提醒。✅B 任务：新增 `zhang_agent_2/.../serial_bridge.py`（M5SerialBridge），更新 `duel.py` + `__main__.py` 支持 `--display` flag 将对话实时广播为 DUEL 分屏命令到两台板（115200 baud，cores3_encounter.ino 兼容）；PC2 音频待固件切换后补接。
