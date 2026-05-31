@@ -672,8 +672,8 @@ async def main() -> None:
         while True:
             now = time.time()
             active = [p for p in peers.values() if now - p.seen_at < PAIR_LOST_AFTER]
-            # 串口虚拟 peer
-            if len(SERIAL_PORTS) >= 2:
+            # 串口虚拟 peer：任何串口连着就当在线
+            if SERIAL_PORTS:
                 seen_personas = {p.persona for p in active}
                 active.extend(p for p in serial_virtual_peers(now) if p.persona not in seen_personas)
             # WS 虚拟 peer：板子连了 WiFi 就直接算在线
