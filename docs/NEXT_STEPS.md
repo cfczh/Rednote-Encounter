@@ -107,3 +107,7 @@
 - 2026-05-31 修复分屏动画：cores3_encounter.ino 的 drawDuelScreen 原来用 drawDuelPanel() 程序画假小人(圆+线)，没读 SD 卡。已改为 drawDuelPersonaFrame() 逐帧读 /<persona>/animations/<state>/ 的 PNG，左右各维护目录句柄，SD 取不到才回退占位符；loop 刷帧扩展到分屏模式。commit b840851。
 - 2026-05-31 编译并烧录两块板：COM3=xiao_hong(slot0)、COM7=zhang_zong(slot1)，hash 校验通过。串口实测 DUEL 命令解析正确、板子能成功 drawPng（anim ... PNG OK）。记录中文 build 路径坑 + 编译烧录速查于 §7。
 - 2026-05-31 新增 BLE 自动分屏（commit 5bb1c4d）：两块板只要 BLE 探测到对方(REDNOTE- 名字)就自动进入并保持分屏，对方离开 12s 才退回单人；状态随距离 social=chat/visiting=meet/其余=outdoor。⚠️重要坑：128bit 服务 UUID 占满 31 字节广播包，厂商数据(personaId)被丢弃→扫描里 peer 列恒为 `--`，所以不能靠 personaId 识别对方，只能靠 BLE 名字前缀。已烧录两板并串口实测：开机首轮即 `[auto-duel] peer detected -> split screen (state=chat)`。
+- 2026-05-31 ⚠️素材大小问题（重要）：分屏右侧张总一直显示占位笑脸。串口诊断 diagPersonaFrames 发现 **zhang_zong 的帧 PNG 每张 ~950KB**（小红才 65KB），超原 140KB 上限被拒。仓库 `animation_frame/boss/Boss/*.png` 也是 ~900-990KB 的未压缩原图。
+  - 固件已临时兜底（commit 59c0611）：kMaxFrameBytes 提到 2MB + 帧缓冲改 ps_malloc 走 PSRAM，能解码大图——但 950KB 解码很慢，会拖慢主循环和 BLE 扫描（实测 18s 只跑 1 轮扫描）。**正解是缩图**。
+  - 新增 `tools/shrink_frames.py`（commit 见下）：递归缩到 320x240、压 <120KB、**保留文件名/扩展名/子目录结构**，适合直接对 SD 卡上 `zhang_zong/animations` 整个目录跑。实测 boss 原图 893KB→27KB（约 1/31）。
+  - **TODO（真人做）**：把 SD 卡上 zhang_zong（及任何超大）帧用该脚本缩小后替换回卡里，张总动画就会和小红一样流畅。命令：`C:\Users\fujisyuke\anaconda3\python.exe tools/shrink_frames.py <卡盘符>:\zhang_zong\animations`（默认输出到 `_small/`，确认后替换；或加 `--inplace` 就地覆盖会自动备份）。
