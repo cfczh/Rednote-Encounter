@@ -17,6 +17,7 @@ __MACOSX/
 
 # --- Arduino build artifacts ---
 build/
+.build/
 *.bin
 *.elf
 *.hex

@@ -80,6 +80,29 @@
 - **旧 BLE 方案**：**保留**，作为「两台靠近」的测距/触发来源；新方案（USB串口+PNG+PCM）负责动画与语音。两者最终通过：BLE 判断靠近 → 触发后端 → 后端走串口/未来WebSocket 驱动板子动画+语音。
 - 因此旧 `pc_ble_agent_bridge.py` / `cores3_encounter.ino` **不要归档、不要删**。
 
+## 7. 编译 / 烧录速查（实测可用）
+> Windows + arduino-cli 1.5.0，核心 `m5stack:esp32` 3.3.7，库 M5Unified/M5GFX 已装。
+
+- **FQBN**：`m5stack:esp32:m5stack_cores3`
+- **⚠️ build 路径不能含中文**：项目在 `D:\2026春学期\...`，GNU 链接器 `ld.exe` 在中文路径写 `.elf` 会乱码报 `cannot open output file`。
+  解决：编译时用 `--build-path C:\m5build\xx`（纯英文）。源码可在中文路径（arduino-cli 会先把 .ino 拷进 build 目录）。
+- **人格槽位**用编译宏区分：`--build-property "compiler.cpp.extra_flags=-DLOCAL_PERSONA_SLOT=0"`（0=xiao_hong，1=zhang_zong）。
+- 两块板（都是 ESP32-S3 原生 USB，VID 303A）：
+  - **COM3 = xiao_hong (slot 0)**，MAC 44:1b:f6:e1:fb:2c
+  - **COM7 = zhang_zong (slot 1)**，MAC 44:1b:f6:e1:fc:10
+- 命令示例：
+  ```powershell
+  $cli = "C:\Program Files\Arduino CLI\arduino-cli.exe"
+  $sk  = "D:\2026春学期\AI_builder_rednote\cores3_encounter"
+  & $cli compile --fqbn m5stack:esp32:m5stack_cores3 --build-path C:\m5build\xh --build-property "compiler.cpp.extra_flags=-DLOCAL_PERSONA_SLOT=0" $sk
+  & $cli upload -p COM3 --fqbn m5stack:esp32:m5stack_cores3 --input-dir C:\m5build\xh $sk
+  ```
+- **分屏测试**：板子串口 115200，发一行 `DUEL|<left>|<right>|<speaker>|<state>|<text>`，
+  例 `DUEL|xiao_hong|zhang_zong|zhang_zong|chat|hello`，进入分屏约 12 秒。
+  收到会回显 `SERIAL DUEL: ...`。⚠️ cores3_encounter 文字气泡用默认字体，**中文会显示成方块**（动画 PNG 不受影响）——要中文气泡需换 efontCN 字体，留作后续。
+
 ## 续跑日志
 - 2026-05-31 初始建立本文档（人工会话）。
 - 2026-05-31 确认方向：续跑保守(每次1-2项)；旧BLE方案保留仅作测距用。
+- 2026-05-31 修复分屏动画：cores3_encounter.ino 的 drawDuelScreen 原来用 drawDuelPanel() 程序画假小人(圆+线)，没读 SD 卡。已改为 drawDuelPersonaFrame() 逐帧读 /<persona>/animations/<state>/ 的 PNG，左右各维护目录句柄，SD 取不到才回退占位符；loop 刷帧扩展到分屏模式。commit b840851。
+- 2026-05-31 编译并烧录两块板：COM3=xiao_hong(slot0)、COM7=zhang_zong(slot1)，hash 校验通过。串口实测 DUEL 命令解析正确、板子能成功 drawPng（anim ... PNG OK）。记录中文 build 路径坑 + 编译烧录速查于 §7。
