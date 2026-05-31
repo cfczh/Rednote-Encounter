@@ -101,6 +101,18 @@ uint32_t serialDuelUntilMs = 0;    // 串口 DUEL 命令的优先窗口（此期
 const uint32_t kPeerFreshMs = 12000;   // 对方多久没刷新就视为离开（退出分屏）
 const uint32_t kAutoDuelKeepMs = 8000; // 探测到对方时分屏保活时长（> 扫描间隔即可）
 const size_t kMaxFrameBytes = 2000000; // 单帧最大字节(走 PSRAM)；超大图建议缩图以保流畅
+bool autoDuelActive = false;           // 当前是否处于「BLE 自动分屏」中（用于触发离开转场）
+const uint32_t kLeaveShowMs = 4000;    // 对方离开后单屏 leave 动画播放时长
+
+// 分屏模式双人动画目录句柄（声明在前，供 updateAutoDuel 等提前引用）
+File duelLeftAnimDir;
+bool duelLeftAnimOpen = false;
+String duelLeftAnimPersona;
+String duelLeftAnimState;
+File duelRightAnimDir;
+bool duelRightAnimOpen = false;
+String duelRightAnimPersona;
+String duelRightAnimState;
 uint32_t lastScanMs = 0;
 uint32_t lastDrawMs = 0;
 uint32_t lastSoundMs = 0;
@@ -438,14 +450,27 @@ bool duelPeerPresent() {
   return false;
 }
 
-// BLE 自动分屏：只要持续探测到对方板，就进入并保持分屏；对方离开后自动退回单人。
+// BLE 自动分屏：只要持续探测到对方板，就进入并保持分屏（outdoor/meet/chat）。
+// 对方离开后，先播一段【单屏 leave 离开动画(同屏)】再退回 idle。
 // 串口 DUEL 命令（后端驱动）在其 12s 窗口内优先，不被这里覆盖。
 void updateAutoDuel() {
   if (!autoDuelEnabled) return;
   uint32_t now = millis();
   if (now < serialDuelUntilMs) return;                       // 让位给串口 DUEL
 
-  if (!duelPeerPresent()) return;                            // 没探测到对方：到点自动退出
+  if (!duelPeerPresent()) {
+    // 对方离开：若刚才在分屏，做「分屏→合屏离开」转场
+    if (autoDuelActive) {
+      autoDuelActive = false;
+      duelMode = false;                                      // 退出分屏(合屏)
+      if (duelLeftAnimOpen)  { duelLeftAnimDir.close();  duelLeftAnimOpen  = false; }
+      if (duelRightAnimOpen) { duelRightAnimDir.close(); duelRightAnimOpen = false; }
+      transitionAction(ACTION_COOLDOWN);                     // 单屏播本机 leave 动画
+      actionHoldUntilMs = now + kLeaveShowMs;                // 保持几秒不被 RSSI 覆盖
+      Serial.println("[auto-duel] peer left -> leave animation (full screen, 同屏)");
+    }
+    return;                                                  // 之后由 FSM 回到 idle
+  }
 
   bool wasDuel = duelMode;
 
@@ -454,7 +479,7 @@ void updateAutoDuel() {
   duelRight = "zhang_zong";
   duelText  = "";                                            // 自动模式无对白
 
-  // 状态随距离变化：很近=chat，较近=meet，否则=outdoor(正在靠近)
+  // 状态随距离变化：很近=chat，较近=meet，否则=outdoor(正在靠近)；均为分屏
   PeerState ps = localPeerState();
   duelState = (ps == PEER_SOCIAL) ? "chat" : (ps == PEER_VISITING) ? "meet" : "outdoor";
 
@@ -462,6 +487,7 @@ void updateAutoDuel() {
   duelSpeaker = ((now / 2500) % 2 == 0) ? duelLeft : duelRight;
 
   duelMode = true;
+  autoDuelActive = true;
   duelUntilMs = now + kAutoDuelKeepMs;                       // 持续探测到就一直续期
 
   if (!wasDuel) {
@@ -783,17 +809,6 @@ void drawSdHint() {
 File animDir;
 bool animDirOpen = false;
 ActionState animDirState = (ActionState)0xFF;
-
-// 分屏模式双人动画目录
-File duelLeftAnimDir;
-bool duelLeftAnimOpen = false;
-String duelLeftAnimPersona;
-String duelLeftAnimState;
-
-File duelRightAnimDir;
-bool duelRightAnimOpen = false;
-String duelRightAnimPersona;
-String duelRightAnimState;
 
 bool openAnimDir() {
   if (!sdReady) return false;
