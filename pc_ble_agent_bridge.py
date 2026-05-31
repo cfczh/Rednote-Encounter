@@ -9,7 +9,7 @@ PROJECT_SERVICE_UUID = "7f1d2b10-7b6a-4f5d-9a46-202605260001"
 AGENT_COMMAND_CHAR_UUID = "7f1d2b11-7b6a-4f5d-9a46-202605260001"
 PROJECT_COMPANY_ID = 0xFFFF
 ROOT = Path(__file__).resolve().parent
-ZHANG_AGENT_ENV = ROOT / "zhang" / "zhang-agent" / ".env"
+ZHANG_AGENT_ENV = ROOT / "zhang_agent_2" / "zhang-agent" / ".env"
 XIAO_HONG_SKILL = ROOT / "xiao_hong" / "xiao_hong"
 ZHANG_ZONG_SKILL = ROOT / "zhang_zong_skill"
 
@@ -262,6 +262,16 @@ def make_fallback_reply(self_peer: Peer, other_peer: Peer, mode: str = "gift") -
 #    affinity 0-100。>=50 -> 亮特产(gift)，<50 -> 踢人(kick)。
 # ======================================================================
 
+# Override the older fallback strings above, which were damaged by an
+# encoding round-trip in an earlier file move.
+def make_fallback_reply(self_peer: Peer, other_peer: Peer, mode: str = "gift") -> str:
+    if self_peer.persona == "xiao_hong":
+        return "你先回吧。" if mode == "kick" else "那好吧，等一会儿。"
+    if self_peer.persona == "zhang_zong":
+        return "没空，回去干活。" if mode == "kick" else "来了就别磨蹭。"
+    return f"met {other_peer.persona}"
+
+
 AFFINITY_THRESHOLD = 50
 
 # 两个人格之间的基础好感度（无序对）
@@ -269,6 +279,7 @@ PAIR_BASE = {
     frozenset({"xiao_hong", "zhang_zong"}): 38,   # 慢热有边界 vs 直接压迫，天然偏低
 }
 DEFAULT_PAIR_BASE = 50
+USE_LLM = os.getenv("REDNOTE_USE_LLM", "0").strip() == "1"
 
 
 def favorability(a: Peer, b: Peer, history_bonus: int = 0) -> int:
@@ -298,16 +309,104 @@ def favorability_mode(score: int) -> str:
 
 
 # ======================================================================
-# 2. 设备指令下发（BLE GATT）
-#    回复文字 = 纯 UTF-8；动画指令 = "#ACT:<name>"（见 PROTOCOL.md §6）
+# 2. 设备指令下发（BLE GATT + 串口双通道）
+#    串口优先（快），BLE GATT 兜底（无线）
 # ======================================================================
 
-CMD_THINKING = "#ACT:thinking"
+CMD_OUTDOOR = "#ACT:outdoor"
+CMD_CHAT = "#ACT:chat"
 CMD_LEAVE = "#ACT:leave"
+
+# 串口映射：环境变量 XIAO_HONG_SERIAL_PORT / ZHANG_ZONG_SERIAL_PORT
+SERIAL_PORTS: dict[str, str] = {}
+_serial_writers: dict[str, object] = {}
+SERIAL_PERSONA_IDS = {
+    "xiao_hong": 1,
+    "zhang_zong": 2,
+}
+SERIAL_DEVICE_IDS = {
+    "xiao_hong": 0xC003,
+    "zhang_zong": 0xC007,
+}
+SERIAL_GIFT_IDS = {
+    "xiao_hong": 1,
+    "zhang_zong": 2,
+}
+
+
+def _init_serial_ports() -> None:
+    for persona, env_key in [("xiao_hong", "XIAO_HONG_SERIAL_PORT"),
+                              ("zhang_zong", "ZHANG_ZONG_SERIAL_PORT")]:
+        port = os.getenv(env_key, "").strip()
+        if port:
+            SERIAL_PORTS[persona] = port
+
+
+def _open_serial(persona: str, port: str):
+    if persona in _serial_writers:
+        return _serial_writers[persona]
+    try:
+        import serial  # pyserial
+        ser = serial.Serial(port, 115200, timeout=0.5, write_timeout=0.5)
+        _serial_writers[persona] = ser
+        print(f"Serial {persona}: {port} @ 115200")
+        return ser
+    except ImportError:
+        print("pyserial not installed, serial disabled. pip install pyserial")
+        return None
+    except Exception as exc:
+        print(f"Serial {persona} {port}: {exc}")
+        return None
+
+
+def _send_serial(persona: str, payload: str) -> bool:
+    if persona not in SERIAL_PORTS:
+        return False
+    ser = _open_serial(persona, SERIAL_PORTS[persona])
+    if not ser:
+        return False
+    try:
+        ser.write((payload + "\n").encode("utf-8"))
+        ser.flush()
+        return True
+    except Exception as exc:
+        print(f"  Serial send failed -> {persona}: {exc}")
+        return False
+
+
+def _persona_to_serial(persona: str) -> str | None:
+    return SERIAL_PORTS.get(persona)
+
+
+def build_serial_txt(state: str, text: str = "") -> str:
+    """构造 TXT|state|text 串口指令，与 animation.ino 兼容"""
+    return f"TXT|{state}|{text}"
+
+
+def build_serial_duel(left: str, right: str, speaker: str = "", state: str = "chat", text: str = "") -> str:
+    text = text.replace("|", " ")
+    return f"DUEL|{left}|{right}|{speaker}|{state}|{text}"
+
+
+def serial_payload_for(payload: str) -> str:
+    if payload.startswith("#ACT:"):
+        action = payload[5:].strip()
+        if action.startswith("encounter"):
+            action = "outdoor"
+        if action == "thinking":
+            action = "outdoor"
+        return build_serial_txt(action)
+    return build_serial_txt("chat", payload)
+
+
+def send_duel_serial(left: Peer, right: Peer, speaker: str = "", state: str = "chat", text: str = "") -> None:
+    payload = build_serial_duel(left.persona, right.persona, speaker, state, text)
+    _send_serial(left.persona, payload)
+    _send_serial(right.persona, payload)
 
 
 def cmd_encounter(mode: str) -> str:
-    return f"#ACT:encounter_{mode}"      # encounter_gift / encounter_kick
+    return CMD_OUTDOOR
 
 
 async def send_to_device(address: str, payload: str) -> bool:
@@ -321,6 +420,39 @@ async def send_to_device(address: str, payload: str) -> bool:
     except Exception as exc:
         print(f"  Send failed -> {address}: {exc}")
         return False
+
+
+async def send_to_peer(peer: Peer, payload: str) -> bool:
+    """串口优先，BLE 兜底"""
+    serial_ok = False
+    if peer.persona in SERIAL_PORTS:
+        serial_ok = _send_serial(peer.persona, serial_payload_for(payload))
+    if serial_ok:
+        print(f"  -> {peer.persona} via serial: {payload[:40]}")
+        return True
+    return await send_to_device(peer.address, payload)
+
+
+def serial_virtual_peers(now: float) -> list[Peer]:
+    """Let USB-only bench tests run even when the PC cannot see BLE adverts."""
+    peers = []
+    for persona, port in SERIAL_PORTS.items():
+        persona_id = SERIAL_PERSONA_IDS.get(persona)
+        if not persona_id:
+            continue
+        peers.append(Peer(
+            address="",
+            name=f"SERIAL-{port}",
+            rssi=-42,
+            device_id=SERIAL_DEVICE_IDS.get(persona, 0xC000 + persona_id),
+            persona_id=persona_id,
+            state=3,
+            gift_id=SERIAL_GIFT_IDS.get(persona, 0),
+            flags=0,
+            counter=0,
+            seen_at=now,
+        ))
+    return peers
 
 
 # ======================================================================
@@ -376,6 +508,10 @@ PAIR_LOST_AFTER = 12.0     # 对方多久没出现算"离开"（秒）
 PAIR_COOLDOWN = 25.0       # 一段相遇结束后，这对设备多久内不再触发
 
 
+ENCOUNTER_SHOW_SEC = 3.0
+TURN_INTERVAL_SEC = 5.0
+
+
 class EncounterSession:
     """一对设备(无序)的一次相遇：encounter -> chatting -> ended。"""
 
@@ -385,6 +521,7 @@ class EncounterSession:
         self.state = "encounter"   # encounter -> chatting -> ended
         self.turns = 0
         self.started = time.time()
+        self.last_turn_at = 0.0
         self.ended_at = 0.0
 
 
@@ -414,6 +551,10 @@ async def main() -> None:
             status = "OK" if f.exists() else "MISSING"
             print(f"  [{status}] {f.relative_to(ROOT)}")
 
+    _init_serial_ports()
+    if SERIAL_PORTS:
+        print(f"Serial ports: {SERIAL_PORTS}")
+
     await start_ws_server()
 
     # ---- 持续扫描：回调实时更新 peers，去掉每轮 discover 的 4 秒等待 ----
@@ -438,11 +579,25 @@ async def main() -> None:
     await scanner.start()
     print(f"Continuous scan started. WS on :{WS_PORT}. Ctrl+C to stop.")
 
+    last_status_brd = 0.0
+
     try:
         while True:
             now = time.time()
             active = [p for p in peers.values() if now - p.seen_at < PAIR_LOST_AFTER]
+            if len(SERIAL_PORTS) >= 2:
+                seen_personas = {p.persona for p in active}
+                active.extend(p for p in serial_virtual_peers(now) if p.persona not in seen_personas)
             active.sort(key=lambda p: p.rssi, reverse=True)
+
+            if now - last_status_brd > 2.0:
+                last_status_brd = now
+                await ws_broadcast({
+                    "type": "status",
+                    "peers": [{"id": f"{p.device_id:04X}", "persona": p.persona,
+                               "rssi": p.rssi, "state": p.state_name}
+                              for p in active]
+                })
 
             print(f"\n[{time.strftime('%H:%M:%S')}] {len(active)} active peer(s):")
             for p in active:
@@ -462,46 +617,65 @@ async def main() -> None:
                         sessions[key] = session
                         print(f"  ENCOUNTER {a.device_id:04X}<->{b.device_id:04X}  "
                               f"affinity={session.affinity} -> {session.mode.upper()}")
-                        await ws_broadcast({"type": "encounter", "a": f"{a.device_id:04X}",
-                                            "b": f"{b.device_id:04X}", "affinity": session.affinity,
+                        await ws_broadcast({"type": "encounter",
+                                            "a": f"{a.device_id:04X}", "a_persona": a.persona,
+                                            "b": f"{b.device_id:04X}", "b_persona": b.persona,
+                                            "affinity": session.affinity,
                                             "mode": session.mode})
-                        # 通知两台板子播对应相遇动画
-                        await send_to_device(a.address, cmd_encounter(session.mode))
-                        await send_to_device(b.address, cmd_encounter(session.mode))
+                        # 通知两台板子播对应相遇动画（串口 + BLE 双通道）
+                        await send_to_peer(a, CMD_OUTDOOR)
+                        await send_to_peer(b, CMD_OUTDOOR)
+                        send_duel_serial(a, b, "", "outdoor", "")
                     elif both_social and not cooled:
                         print(f"  Skip pair: cooldown {int(PAIR_COOLDOWN-(now-session.ended_at))}s")
 
                 # ---------- 相遇动画播完 -> 进入聊天 ----------
                 elif session.state == "encounter":
+                    if now - session.started < ENCOUNTER_SHOW_SEC:
+                        await asyncio.sleep(0.6)
+                        continue
                     session.state = "chatting"
 
                 # ---------- 聊天中：生成对话，或判定结束 ----------
                 elif session.state == "chatting":
+                    if session.last_turn_at and now - session.last_turn_at < TURN_INTERVAL_SEC:
+                        await asyncio.sleep(0.6)
+                        continue
                     if not both_social or session.turns >= MAX_TURNS:
                         reason = "turns" if session.turns >= MAX_TURNS else "left"
                         print(f"  LEAVE {a.device_id:04X}<->{b.device_id:04X} (reason={reason})")
-                        await ws_broadcast({"type": "leave", "a": f"{a.device_id:04X}",
-                                            "b": f"{b.device_id:04X}", "reason": reason})
-                        await send_to_device(a.address, CMD_LEAVE)
-                        await send_to_device(b.address, CMD_LEAVE)
+                        await ws_broadcast({"type": "leave",
+                                            "a": f"{a.device_id:04X}", "a_persona": a.persona,
+                                            "b": f"{b.device_id:04X}", "b_persona": b.persona,
+                                            "reason": reason})
+                        await send_to_peer(a, CMD_LEAVE)
+                        await send_to_peer(b, CMD_LEAVE)
                         brain.reset_session(a.device_id, b.device_id)
                         brain.reset_session(b.device_id, a.device_id)
                         session.state = "ended"
                         session.ended_at = now
                     else:
+                        session.last_turn_at = now
                         session.turns += 1
                         for self_peer, other_peer in ((a, b), (b, a)):
-                            try:
-                                reply = await asyncio.to_thread(
-                                    brain.reply, self_peer, other_peer,
-                                    session.affinity, session.mode, session.turns)
-                            except Exception as exc:
-                                print(f"  Agent failed, fallback: {exc}")
+                            if USE_LLM:
+                                try:
+                                    reply = await asyncio.to_thread(
+                                        brain.reply, self_peer, other_peer,
+                                        session.affinity, session.mode, session.turns)
+                                except Exception as exc:
+                                    print(f"  Agent failed, fallback: {exc}")
+                                    reply = make_fallback_reply(self_peer, other_peer, session.mode)
+                            else:
                                 reply = make_fallback_reply(self_peer, other_peer, session.mode)
                             print(f"  [{session.turns}/{MAX_TURNS}] {self_peer.device_id:04X}: {reply!r}")
-                            await ws_broadcast({"type": "reply", "device": f"{self_peer.device_id:04X}",
+                            await ws_broadcast({"type": "reply",
+                                                "device": f"{self_peer.device_id:04X}",
+                                                "persona": self_peer.persona,
                                                 "turn": session.turns, "text": reply})
-                            await send_to_device(self_peer.address, reply)
+                            send_duel_serial(a, b, self_peer.persona, "chat", reply)
+                            if self_peer.persona not in SERIAL_PORTS:
+                                await send_to_peer(self_peer, reply)
 
             await asyncio.sleep(0.6)
     finally:

@@ -8,10 +8,22 @@
 #include <BLEUtils.h>
 #include <SD.h>
 #include <SPI.h>
+#include <WiFi.h>
+#include <ArduinoWebsockets.h>
 
 #include <algorithm>
 #include <math.h>
 #include <vector>
+
+// ====== WiFi / WebSocket 命令通道（可选，默认关闭，零风险）======
+// 填好下面 4 项后即启用：板子作为 WS 客户端连后端服务器，接收与串口
+// 完全相同的 TXT|/DUEL|/#ACT 命令。WIFI_SSID 留空("")则完全不启动 WiFi，
+// 行为与纯 BLE+串口一致（不影响现有自动分屏）。串口始终保留作调试/回退。
+#define WIFI_SSID ""                     // ← 填你的 WiFi 名
+#define WIFI_PASS ""                     // ← 填你的 WiFi 密码
+#define WS_HOST   "192.168.1.100"        // ← 后端电脑的局域网 IP
+#define WS_PORT   8765
+#define WS_PATH   "/"
 
 enum PeerState : uint8_t {
   PEER_IDLE = 0,
@@ -1521,84 +1533,153 @@ void setup() {
   scanner->setInterval(100);
   scanner->setWindow(80);
 
+  wsBegin();   // 可选 WebSocket 命令通道（WIFI_SSID 为空时不启动）
+
   drawScreen();
 }
 
 // ======================
-// 串口协议（与 animation.ino 兼容，补充 BLE GATT）
+// 命令协议（串口 与 WebSocket 共用同一套解析）
+// 支持：TXT|<state>|<text>  DUEL|<l>|<r>|<speaker>|<state>|<text>  #ACT:<state>
 // ======================
-void handleSerialCommands() {
-  while (Serial.available()) {
-    String line = Serial.readStringUntil('\n');
-    line.trim();
-    if (!line.length()) continue;
+void processCommandLine(String line) {
+  line.trim();
+  if (!line.length()) return;
 
-    // TXT|<state>|<text>  直接切换动画状态 + 显示文字
-    if (line.startsWith("TXT|")) {
-      int p1 = line.indexOf('|', 4);
-      String stateName = (p1 > 0) ? line.substring(4, p1) : line.substring(4);
-      String text = (p1 > 0) ? line.substring(p1 + 1) : "";
-      stateName.trim();
-      text.trim();
+  // TXT|<state>|<text>  直接切换动画状态 + 显示文字
+  if (line.startsWith("TXT|")) {
+    int p1 = line.indexOf('|', 4);
+    String stateName = (p1 > 0) ? line.substring(4, p1) : line.substring(4);
+    String text = (p1 > 0) ? line.substring(p1 + 1) : "";
+    stateName.trim();
+    text.trim();
+
+    ActionState target;
+    if (actionFromName(stateName, &target)) {
+      transitionAction(target);
+      actionHoldUntilMs = millis() + (target == ACTION_COOLDOWN ? 4000 : 12000);   // 防本地 RSSI 覆盖
+      Serial.printf("CMD TXT: state=%s text='%s'\n", stateName.c_str(), text.c_str());
+    } else {
+      Serial.printf("CMD TXT: unknown state '%s'\n", stateName.c_str());
+    }
+
+    if (text.length()) {
+      lastAgentText = text;
+      lastAgentTextMs = millis();
+    }
+    return;
+  }
+
+  // DUEL|<left>|<right>|<speaker>|<state>|<text>  双人分屏
+  if (line.startsWith("DUEL|")) {
+    int p1 = line.indexOf('|', 5);
+    int p2 = p1 > 0 ? line.indexOf('|', p1 + 1) : -1;
+    int p3 = p2 > 0 ? line.indexOf('|', p2 + 1) : -1;
+    int p4 = p3 > 0 ? line.indexOf('|', p3 + 1) : -1;
+    if (p1 > 0 && p2 > 0 && p3 > 0 && p4 > 0) {
+      duelLeft = line.substring(5, p1);
+      duelRight = line.substring(p1 + 1, p2);
+      duelSpeaker = line.substring(p2 + 1, p3);
+      duelState = line.substring(p3 + 1, p4);
+      duelText = line.substring(p4 + 1);
+      duelLeft.trim();
+      duelRight.trim();
+      duelSpeaker.trim();
+      duelState.trim();
+      duelText.trim();
 
       ActionState target;
-      if (actionFromName(stateName, &target)) {
+      if (actionFromName(duelState, &target)) {
         transitionAction(target);
-        actionHoldUntilMs = millis() + (target == ACTION_COOLDOWN ? 4000 : 12000);   // 防本地 RSSI 覆盖
-        Serial.printf("SERIAL TXT: state=%s text='%s'\n", stateName.c_str(), text.c_str());
-      } else {
-        Serial.printf("SERIAL TXT: unknown state '%s'\n", stateName.c_str());
+        actionHoldUntilMs = millis() + 12000;
       }
-
-      if (text.length()) {
-        lastAgentText = text;
+      if (duelText.length()) {
+        lastAgentText = duelText;
         lastAgentTextMs = millis();
       }
-      continue;
+      duelMode = true;
+      duelUntilMs = millis() + 12000;
+      serialDuelUntilMs = millis() + 12000;   // 后端命令优先窗口，期间不被自动分屏覆盖
+      // 重置分屏动画目录（人物或状态变化时重新打开）
+      if (duelLeftAnimOpen)  { duelLeftAnimDir.close();  duelLeftAnimOpen  = false; }
+      if (duelRightAnimOpen) { duelRightAnimDir.close(); duelRightAnimOpen = false; }
+      Serial.printf("CMD DUEL: %s | %s says '%s'\n",
+                    duelState.c_str(), duelSpeaker.c_str(), duelText.c_str());
+    } else {
+      Serial.printf("CMD DUEL malformed: %s\n", line.c_str());
     }
+    return;
+  }
 
-    // DUEL|<left>|<right>|<speaker>|<state>|<text>  双人分屏（预留）
-    if (line.startsWith("DUEL|")) {
-      int p1 = line.indexOf('|', 5);
-      int p2 = p1 > 0 ? line.indexOf('|', p1 + 1) : -1;
-      int p3 = p2 > 0 ? line.indexOf('|', p2 + 1) : -1;
-      int p4 = p3 > 0 ? line.indexOf('|', p3 + 1) : -1;
-      if (p1 > 0 && p2 > 0 && p3 > 0 && p4 > 0) {
-        duelLeft = line.substring(5, p1);
-        duelRight = line.substring(p1 + 1, p2);
-        duelSpeaker = line.substring(p2 + 1, p3);
-        duelState = line.substring(p3 + 1, p4);
-        duelText = line.substring(p4 + 1);
-        duelLeft.trim();
-        duelRight.trim();
-        duelSpeaker.trim();
-        duelState.trim();
-        duelText.trim();
-
-        ActionState target;
-        if (actionFromName(duelState, &target)) {
-          transitionAction(target);
-          actionHoldUntilMs = millis() + 12000;
-        }
-        if (duelText.length()) {
-          lastAgentText = duelText;
-          lastAgentTextMs = millis();
-        }
-        duelMode = true;
-        duelUntilMs = millis() + 12000;
-        serialDuelUntilMs = millis() + 12000;   // 串口命令优先窗口，期间不被自动分屏覆盖
-        // 重置分屏动画目录（人物或状态变化时重新打开）
-        if (duelLeftAnimOpen)  { duelLeftAnimDir.close();  duelLeftAnimOpen  = false; }
-        if (duelRightAnimOpen) { duelRightAnimDir.close(); duelRightAnimOpen = false; }
-        Serial.printf("SERIAL DUEL: %s | %s says '%s'\n",
-                      duelState.c_str(), duelSpeaker.c_str(), duelText.c_str());
-      } else {
-        Serial.printf("SERIAL DUEL malformed: %s\n", line.c_str());
-      }
-      continue;
+  // #ACT:<state>  仅切动画状态（与 BLE GATT 指令一致）
+  if (line.startsWith("#ACT:")) {
+    String name = line.substring(5);
+    name.trim();
+    ActionState target;
+    if (actionFromName(name, &target)) {
+      transitionAction(target);
+      actionHoldUntilMs = millis() + (target == ACTION_COOLDOWN ? 4000 : 12000);
+      Serial.printf("CMD ACT: %s\n", name.c_str());
+    } else {
+      Serial.printf("CMD ACT: unknown '%s'\n", name.c_str());
     }
+    return;
+  }
 
-    Serial.printf("SERIAL: %s\n", line.c_str());
+  Serial.printf("CMD(ignored): %s\n", line.c_str());
+}
+
+void handleSerialCommands() {
+  while (Serial.available()) {
+    processCommandLine(Serial.readStringUntil('\n'));
+  }
+}
+
+// ====== WebSocket 命令通道（板子作为客户端连后端 WS 服务器）======
+using namespace websockets;
+WebsocketsClient wsClient;
+bool wsEnabled = false;
+uint32_t lastWsAttemptMs = 0;
+
+void onWsMessage(WebsocketsMessage message) {
+  processCommandLine(message.data());   // WS 与串口走同一套命令解析
+}
+
+void onWsEvent(WebsocketsEvent event, String data) {
+  if (event == WebsocketsEvent::ConnectionClosed) {
+    Serial.println("[ws] connection closed");
+  }
+}
+
+void wsBegin() {
+  if (strlen(WIFI_SSID) == 0) {                 // 未配置 WiFi -> 完全不启动，纯 BLE+串口
+    wsEnabled = false;
+    Serial.println("[ws] disabled (WIFI_SSID 为空，仅用 BLE+串口)");
+    return;
+  }
+  wsEnabled = true;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  wsClient.onMessage(onWsMessage);
+  wsClient.onEvent(onWsEvent);
+  Serial.printf("[ws] WiFi 连接中: %s\n", WIFI_SSID);
+}
+
+void wsLoop() {
+  if (!wsEnabled) return;
+  if (wsClient.available()) {                   // 已连：泵收消息
+    wsClient.poll();
+    return;
+  }
+  uint32_t now = millis();                       // 未连：每 5s 重试
+  if (now - lastWsAttemptMs < 5000) return;
+  lastWsAttemptMs = now;
+  if (WiFi.status() != WL_CONNECTED) return;     // 等 WiFi 就绪
+  String url = String("ws://") + WS_HOST + ":" + String(WS_PORT) + WS_PATH;
+  Serial.printf("[ws] 连接服务器 %s\n", url.c_str());
+  if (wsClient.connect(url)) {
+    Serial.println("[ws] 已连接");
+    wsClient.send(String("HELLO|") + localPersona.codeName);  // 告知后端本机人格
   }
 }
 
@@ -1607,6 +1688,7 @@ void loop() {
   uint32_t now = millis();
 
   handleSerialCommands();
+  wsLoop();
 
   auto touch = M5.Touch.getDetail();
   if (touch.wasHold()) {
