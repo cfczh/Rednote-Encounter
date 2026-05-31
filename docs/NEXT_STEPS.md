@@ -106,3 +106,4 @@
 - 2026-05-31 确认方向：续跑保守(每次1-2项)；旧BLE方案保留仅作测距用。
 - 2026-05-31 修复分屏动画：cores3_encounter.ino 的 drawDuelScreen 原来用 drawDuelPanel() 程序画假小人(圆+线)，没读 SD 卡。已改为 drawDuelPersonaFrame() 逐帧读 /<persona>/animations/<state>/ 的 PNG，左右各维护目录句柄，SD 取不到才回退占位符；loop 刷帧扩展到分屏模式。commit b840851。
 - 2026-05-31 编译并烧录两块板：COM3=xiao_hong(slot0)、COM7=zhang_zong(slot1)，hash 校验通过。串口实测 DUEL 命令解析正确、板子能成功 drawPng（anim ... PNG OK）。记录中文 build 路径坑 + 编译烧录速查于 §7。
+- 2026-05-31 新增 BLE 自动分屏（commit 5bb1c4d）：两块板只要 BLE 探测到对方(REDNOTE- 名字)就自动进入并保持分屏，对方离开 12s 才退回单人；状态随距离 social=chat/visiting=meet/其余=outdoor。⚠️重要坑：128bit 服务 UUID 占满 31 字节广播包，厂商数据(personaId)被丢弃→扫描里 peer 列恒为 `--`，所以不能靠 personaId 识别对方，只能靠 BLE 名字前缀。已烧录两板并串口实测：开机首轮即 `[auto-duel] peer detected -> split screen (state=chat)`。
