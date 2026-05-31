@@ -19,7 +19,7 @@
 // 填好下面 4 项后即启用：板子作为 WS 客户端连后端服务器，接收与串口
 // 完全相同的 TXT|/DUEL|/#ACT 命令。WIFI_SSID 留空("")则完全不启动 WiFi，
 // 行为与纯 BLE+串口一致（不影响现有自动分屏）。串口始终保留作调试/回退。
-#define WIFI_SSID "iphone"               // ← 填你的 WiFi 名
+#define WIFI_SSID "iPhone"              // ← 填你的 WiFi 名
 #define WIFI_PASS "12345678"             // ← 填你的 WiFi 密码
 #define WS_HOST   "172.20.10.8"          // ← 后端电脑的局域网 IP
 #define WS_PORT   8765
@@ -1524,6 +1524,9 @@ void setup() {
   initSdAssets();
   localDeviceId = makeLocalDeviceId();
   localBleName = localPeerName();
+
+  wsBegin();   // 先连 WiFi（BLE 和 WiFi 共享射频，WiFi 先初始才能用）
+
   BLEDevice::init(localBleName.c_str());
   startAgentGattServer();
   startPeerAdvertising(localBleName);
@@ -1532,8 +1535,6 @@ void setup() {
   scanner->setActiveScan(true);
   scanner->setInterval(100);
   scanner->setWindow(80);
-
-  wsBegin();   // 可选 WebSocket 命令通道（WIFI_SSID 为空时不启动）
 
   drawScreen();
 }
@@ -1658,6 +1659,7 @@ void wsBegin() {
   }
   wsEnabled = true;
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);                          // 不休眠, 避免与 BLE 冲突
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   wsClient.onMessage(onWsMessage);
   wsClient.onEvent(onWsEvent);
@@ -1675,7 +1677,8 @@ void wsLoop() {
   lastWsAttemptMs = now;
 
   wl_status_t st = WiFi.status();
-  Serial.printf("[ws] WiFi status=%d (SSID=%s)\n", (int)st, WiFi.SSID().c_str());
+  Serial.printf("[ws] WiFi status=%d target='%s'\n", (int)st, WIFI_SSID);
+
   if (st != WL_CONNECTED) return;               // 等 WiFi 就绪
 
   String url = String("ws://") + WS_HOST + ":" + String(WS_PORT) + WS_PATH;
