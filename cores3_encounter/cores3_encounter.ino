@@ -85,8 +85,17 @@ uint16_t localDeviceId = 0;
 uint8_t localAdvertiseCounter = 0;
 uint32_t lastAdvertiseUpdateMs = 0;
 String pendingAgentText;
+String pendingActionCmd;          // 收到的 #ACT:<name> 指令名（去掉前缀）
+uint32_t actionHoldUntilMs = 0;   // bridge 强制动作后，暂停本地 RSSI 状态机到此刻
 String lastAgentText;
 uint32_t lastAgentTextMs = 0;
+bool duelMode = false;
+String duelLeft;
+String duelRight;
+String duelSpeaker;
+String duelText;
+String duelState;
+uint32_t duelUntilMs = 0;
 uint32_t lastScanMs = 0;
 uint32_t lastDrawMs = 0;
 uint32_t lastSoundMs = 0;
@@ -183,16 +192,39 @@ const char* closeWavPath  = "/cores3_assets/close.wav";
 const char* repeatWavPath = "/cores3_assets/repeat.wav";
 const char* videoDir      = "/cores3_assets/video";
 
-const char* actionAnimDir(ActionState action) {
+// 把内部动作状态映射到 SD 卡上的动画子目录名（与设计图/SD 结构一致）。
+// idle(待机) / meet(靠近未开聊) / outdoor(开聊前转场) / chat(对话中) / leave(结束)
+const char* actionStateFolder(ActionState action) {
   switch (action) {
-    case ACTION_SEARCHING: return "/cores3_assets/animations/searching";
-    case ACTION_NEAR:      return "/cores3_assets/animations/near";
-    case ACTION_ENCOUNTER: return "/cores3_assets/animations/encounter";
-    case ACTION_THINKING:  return "/cores3_assets/animations/thinking";
-    case ACTION_REPLY:     return "/cores3_assets/animations/reply";
-    case ACTION_COOLDOWN:  return "/cores3_assets/animations/cooldown";
-    default:               return "/cores3_assets/animations/searching";
+    case ACTION_SEARCHING: return "idle";
+    case ACTION_NEAR:      return "meet";
+    case ACTION_ENCOUNTER: return "outdoor";
+    case ACTION_THINKING:  return "outdoor";
+    case ACTION_REPLY:     return "chat";
+    case ACTION_COOLDOWN:  return "leave";
+    default:               return "idle";
   }
+}
+
+// 完整动画目录：/<persona>/animations/<state>，如 /xiao_hong/animations/idle
+const char* actionAnimDir(ActionState action) {
+  static char buf[64];
+  snprintf(buf, sizeof(buf), "/%s/animations/%s",
+           localPersona.codeName, actionStateFolder(action));
+  return buf;
+}
+
+// 把 #ACT:<name> 指令名映射回内部动作状态。
+bool actionFromName(const String& name, ActionState* out) {
+  if (name == "idle")    { *out = ACTION_SEARCHING; return true; }
+  if (name == "meet")    { *out = ACTION_NEAR;      return true; }
+  if (name == "outdoor") { *out = ACTION_ENCOUNTER; return true; }
+  if (name == "chat")    { *out = ACTION_REPLY;     return true; }
+  if (name == "leave")   { *out = ACTION_COOLDOWN;  return true; }
+  // 兼容旧 bridge 指令
+  if (name.startsWith("encounter")) { *out = ACTION_ENCOUNTER; return true; }
+  if (name == "thinking") { *out = ACTION_THINKING; return true; }
+  return false;
 }
 
 String proximityLabel(int rssi) {
@@ -294,7 +326,7 @@ PeerState localPeerState() {
 }
 
 const uint32_t kReplyShowMs         = 10000;
-const uint32_t kCooldownMs          = 15000;
+const uint32_t kCooldownMs          = 4000;
 const uint32_t kThinkingTimeoutMs   = 15000;
 const uint32_t kEncounterCooldownMs = 20000;
 
@@ -313,6 +345,20 @@ void updateActionState() {
   uint32_t now = millis();
   int best   = bestRssi();
   int active = activeCount();
+
+  // bridge 下发的 #ACT 指令优先：强制切动画，并暂停本地 RSSI 状态机一段时间
+  if (pendingActionCmd.length()) {
+    ActionState target;
+    if (actionFromName(pendingActionCmd, &target)) {
+      transitionAction(target);
+      actionHoldUntilMs = now + (target == ACTION_COOLDOWN ? 4000 : 12000);
+    }
+    pendingActionCmd = "";
+    return;
+  }
+
+  // 处于 bridge 强制动作的保持窗口内，不让本地逻辑覆盖
+  if (now < actionHoldUntilMs) return;
 
   if (pendingAgentText.length()) {
     pendingAgentText = "";
@@ -424,6 +470,20 @@ class AgentCommandCallbacks : public BLECharacteristicCallbacks {
     value.trim();
     if (!value.length()) return;
     if (value.length() > 96) value = value.substring(0, 96);
+
+    if (value.startsWith("#ACT:")) {
+      String actionName = value.substring(5);
+      actionName.trim();
+      ActionState target;
+      if (actionFromName(actionName, &target)) {
+        pendingActionCmd = actionName;
+        Serial.printf("#ACT: %s -> queue\n", actionName.c_str());
+      } else {
+        Serial.printf("#ACT: unknown action '%s'\n", actionName.c_str());
+      }
+      return;
+    }
+
     pendingAgentText = value;
     lastAgentText = value;
     lastAgentTextMs = millis();
@@ -617,9 +677,35 @@ void initSdAssets() {
   Serial.printf("close.wav: %s (%u bytes)\n", closeWav ? "loaded" : "missing", (unsigned)closeWavLen);
   Serial.printf("reply.wav: %s (%u bytes)\n", repeatWav ? "loaded" : "missing", (unsigned)repeatWavLen);
 
-  hasVideoFrames = SD.exists("/cores3_assets/video/frame_0001.jpg");
+  // 遍历 idle 目录，确认至少有 1 个图片文件
+  hasVideoFrames = false;
+  char idleDir[48];
+  snprintf(idleDir, sizeof(idleDir), "/%s/animations/idle", localPersona.codeName);
+  File d = SD.open(idleDir);
+  if (d && d.isDirectory()) {
+    int checked = 0;
+    while (checked < 60) {
+      File f = d.openNextFile();
+      if (!f) break;
+      checked++;
+      String nm = f.name();
+      if (!nm.startsWith(".")) {
+        bool png = nm.endsWith(".png") || nm.endsWith(".PNG");
+        bool jpg = nm.endsWith(".jpg") || nm.endsWith(".JPG") || nm.endsWith(".jpeg") || nm.endsWith(".JPEG");
+        if (png || jpg) {
+          Serial.printf("  idle frame: %s (%u bytes)\n", nm.c_str(), (unsigned)f.size());
+          hasVideoFrames = true;
+          f.close();
+          break;
+        }
+      }
+      f.close();
+    }
+  }
+  if (d) d.close();
   videoMode = hasVideoFrames;
-  Serial.printf("video frames: %s\n", hasVideoFrames ? "found" : "missing");
+  Serial.printf("video frames (%s/idle): %s\n", localPersona.codeName,
+                hasVideoFrames ? "found" : "missing");
 }
 
 void drawSdHint() {
@@ -637,35 +723,191 @@ void drawSdHint() {
   }
 }
 
+// 逐帧动画：遍历当前 persona+状态 目录，按文件顺序循环播放。
+// 支持 PNG / JPG，不依赖具体文件名（与学姐 animation.ino 一致）。
+// 目录随状态变化自动重开；找不到状态目录时回退到 idle。
+File animDir;
+bool animDirOpen = false;
+ActionState animDirState = (ActionState)0xFF;
+
+// 分屏模式双人动画目录
+File duelLeftAnimDir;
+bool duelLeftAnimOpen = false;
+String duelLeftAnimPersona;
+String duelLeftAnimState;
+
+File duelRightAnimDir;
+bool duelRightAnimOpen = false;
+String duelRightAnimPersona;
+String duelRightAnimState;
+
+bool openAnimDir() {
+  if (!sdReady) return false;
+  if (animDirOpen) { animDir.close(); animDirOpen = false; }
+
+  const char* dir = actionAnimDir(currentAction);
+  File d = SD.open(dir);
+  if (!d || !d.isDirectory()) {
+    if (d) d.close();
+    // 回退到本 persona 的 idle 目录
+    char fb[64];
+    snprintf(fb, sizeof(fb), "/%s/animations/idle", localPersona.codeName);
+    d = SD.open(fb);
+    if (!d || !d.isDirectory()) { if (d) d.close(); return false; }
+  }
+  animDir = d;
+  animDirOpen = true;
+  animDirState = currentAction;
+  return true;
+}
+
+// 打开指定 persona + state 的动画目录，找不到时回退 idle
+bool openDuelAnimDir(File& dir, bool& dirOpen, String& openPersona, String& openState,
+                     const String& persona, const String& state) {
+  if (dirOpen) { dir.close(); dirOpen = false; }
+  if (!sdReady) return false;
+  char path[80];
+  snprintf(path, sizeof(path), "/%s/animations/%s", persona.c_str(), state.c_str());
+  File d = SD.open(path);
+  if (!d || !d.isDirectory()) {
+    if (d) d.close();
+    // 回退 idle
+    snprintf(path, sizeof(path), "/%s/animations/idle", persona.c_str());
+    d = SD.open(path);
+    if (!d || !d.isDirectory()) { if (d) d.close(); return false; }
+  }
+  dir = d;
+  dirOpen = true;
+  openPersona = persona;
+  openState = state;
+  return true;
+}
+
+// 读取并绘制指定 persona 的下一帧，绘制区域限定在 (x, y, w, h)
+// 帧取完自动回绕；状态/人物变化时自动重开目录
+bool drawDuelPersonaFrame(File& dir, bool& dirOpen, String& openPersona, String& openState,
+                          const String& persona, const String& state,
+                          int x, int y, int w, int h) {
+  if (!sdReady) return false;
+  if (!dirOpen || openPersona != persona || openState != state) {
+    if (!openDuelAnimDir(dir, dirOpen, openPersona, openState, persona, state)) return false;
+  }
+  File file;
+  bool isPng = false;
+  int tries = 0;
+  while (tries < 60) {
+    file = dir.openNextFile();
+    tries++;
+    if (!file) {
+      dir.close(); dirOpen = false;
+      if (!openDuelAnimDir(dir, dirOpen, openPersona, openState, persona, state)) return false;
+      continue;
+    }
+    String name = file.name();
+    if (name.startsWith(".")) { file.close(); continue; }
+    isPng  = name.endsWith(".png") || name.endsWith(".PNG");
+    bool isJpg = name.endsWith(".jpg")  || name.endsWith(".JPG") ||
+                 name.endsWith(".jpeg") || name.endsWith(".JPEG");
+    if (isPng || isJpg) break;
+    file.close();
+  }
+  if (tries >= 60) return false;
+  size_t size = file.size();
+  if (size == 0 || size > 140000) { file.close(); return false; }
+  uint8_t* buf = (uint8_t*)malloc(size);
+  if (!buf) { file.close(); return false; }
+  size_t readLen = file.read(buf, size);
+  file.close();
+  if (readLen != size) { free(buf); return false; }
+  bool ok = isPng
+    ? M5.Display.drawPng(buf, readLen, x, y, w, h, 0, 0, 0.0f, 0.0f, datum_t::middle_center)
+    : M5.Display.drawJpg(buf, readLen, x, y, w, h, 0, 0, 0.0f, 0.0f, datum_t::middle_center);
+  free(buf);
+  return ok;
+}
+
 bool drawAnimFrame() {
   if (!sdReady) return false;
 
-  const char* dir = actionAnimDir(currentAction);
-  char path[80];
-  snprintf(path, sizeof(path), "%s/frame_%04u.jpg", dir, videoFrame);
-  if (!SD.exists(path)) {
-    videoFrame = 1;
-    snprintf(path, sizeof(path), "%s/frame_%04u.jpg", dir, videoFrame);
-    if (!SD.exists(path)) {
-      snprintf(path, sizeof(path), "%s/frame_%04u.jpg", videoDir, videoFrame);
-      if (!SD.exists(path)) return false;
-    }
+  // 状态切了，或还没打开，重开目录
+  if (!animDirOpen || animDirState != currentAction) {
+    if (!openAnimDir()) return false;
   }
 
-  size_t frameLen = 0;
-  uint8_t* frameData = loadSmallFile(path, &frameLen, 140000);
-  if (!frameData) return false;
+  // 找下一个可读的图片文件（跳过子目录 / 隐藏文件，最多 60 次防死循环）
+  File file;
+  bool isPng = false;
+  int tries = 0;
+  while (tries < 60) {
+    file = animDir.openNextFile();
+    tries++;
+    if (!file) {                 // 播完一轮，回到目录开头
+      animDir.close();
+      animDirOpen = false;
+      if (!openAnimDir()) return false;
+      continue;
+    }
+
+    String name = file.name();
+    if (name.startsWith(".")) { file.close(); continue; }
+    isPng = name.endsWith(".png") || name.endsWith(".PNG");
+    bool isJpg = name.endsWith(".jpg") || name.endsWith(".JPG") ||
+                 name.endsWith(".jpeg") || name.endsWith(".JPEG");
+    if (isPng || isJpg) break;   // 找到图片
+    file.close();                // 非图片，跳过继续
+  }
+  if (tries >= 60) return false; // 目录里没有图片文件
+
+  size_t size = file.size();
+  const size_t kMaxFrame = 140000;
+  if (size == 0 || size > kMaxFrame) { file.close(); return false; }
+
+  uint8_t* buf = (uint8_t*)malloc(size);
+  if (!buf) { file.close(); return false; }
+  size_t readLen = file.read(buf, size);
+  file.close();
+  if (readLen != size) { free(buf); return false; }
 
   M5.Display.fillScreen(TFT_BLACK);
-  bool ok = M5.Display.drawJpg(frameData, frameLen, 0, 0, 320, 240, 0, 0, 1.0f);
-  free(frameData);
+  bool ok = isPng
+    ? M5.Display.drawPng(buf, readLen,
+                         0, 0, M5.Display.width(), M5.Display.height(),
+                         0, 0, 0.0f, 0.0f, datum_t::middle_center)
+    : M5.Display.drawJpg(buf, readLen,
+                         0, 0, M5.Display.width(), M5.Display.height(),
+                         0, 0, 0.0f, 0.0f, datum_t::middle_center);
+  free(buf);
 
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(kMint, TFT_BLACK);
-  M5.Display.setCursor(6, 6);
-  M5.Display.printf("%s f%04u", actionStateName(currentAction), videoFrame);
+  // 测试方块：左上角红色 = 显示工作正常
+  if (debugOverlay) {
+    M5.Display.fillRect(0, 0, 10, 10, kHot);
+    M5.Display.fillRect(M5.Display.width() - 10, 0, 10, 10, kMint);
+  }
 
-  videoFrame++;
+  static uint32_t lastFrameDbg = 0;
+  if (millis() - lastFrameDbg > 3000) {
+    lastFrameDbg = millis();
+    Serial.printf("anim: %s/%s %s %uB %s\n",
+                  localPersona.codeName, actionStateFolder(currentAction),
+                  isPng ? "PNG" : "JPG", (unsigned)readLen,
+                  ok ? "OK" : "FAIL");
+  }
+
+  // 对话文字气泡：底部居中
+  if (lastAgentText.length() && millis() - lastAgentTextMs < 30000) {
+    M5.Display.setTextSize(1);
+    String shown = lastAgentText;
+    if (shown.length() > 40) shown = shown.substring(0, 40);
+    int tw = shown.length() * 10 + 24;
+    int tx = (M5.Display.width() - tw) / 2;
+    if (tx < 4) tx = 4;
+    M5.Display.fillRoundRect(tx, 196, tw, 38, 8, 0x0000);
+    M5.Display.drawRoundRect(tx, 196, tw, 38, 8, kHot);
+    M5.Display.setTextColor(kHot, 0x0000);
+    M5.Display.setCursor(tx + 12, 206);
+    M5.Display.print(shown);
+  }
+
   return ok;
 }
 
@@ -1021,17 +1263,109 @@ void drawDebugOverlay() {
   }
 }
 
+String duelLabel(const String& persona) {
+  if (persona == "xiao_hong") return "XIAO HONG";
+  if (persona == "zhang_zong") return "ZHANG ZONG";
+  return persona.length() ? persona : "?";
+}
+
+void drawDuelPanel(int x, int y, int w, int h, const String& persona, bool active, uint16_t color) {
+  uint16_t border = active ? color : kDim;
+  M5.Display.fillRoundRect(x, y, w, h, 8, active ? 0x18E3 : 0x0841);
+  M5.Display.drawRoundRect(x, y, w, h, 8, border);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(active ? color : kInk, active ? 0x18E3 : 0x0841);
+  M5.Display.setCursor(x + 10, y + 10);
+  M5.Display.print(duelLabel(persona));
+
+  int cx = x + w / 2;
+  int cy = y + 76;
+  M5.Display.drawCircle(cx, cy, active ? 34 : 30, border);
+  M5.Display.fillCircle(cx - 12, cy - 5, 4, kInk);
+  M5.Display.fillCircle(cx + 12, cy - 5, 4, kInk);
+  M5.Display.drawLine(cx - 12, cy + 14, cx, cy + 21, active ? color : kInk);
+  M5.Display.drawLine(cx, cy + 21, cx + 14, cy + 12, active ? color : kInk);
+}
+
+void drawDuelScreen() {
+  M5.Display.fillScreen(TFT_BLACK);
+  bool leftActive  = duelSpeaker == duelLeft;
+  bool rightActive = duelSpeaker == duelRight;
+
+  // 优先从 SD 卡读 PNG 动画帧；SD 取不到时回退到占位符小人
+  bool leftOk  = drawDuelPersonaFrame(
+      duelLeftAnimDir,  duelLeftAnimOpen,  duelLeftAnimPersona,  duelLeftAnimState,
+      duelLeft,  duelState, 8, 16, 148, 148);
+  bool rightOk = drawDuelPersonaFrame(
+      duelRightAnimDir, duelRightAnimOpen, duelRightAnimPersona, duelRightAnimState,
+      duelRight, duelState, 164, 16, 148, 148);
+
+  if (!leftOk)  drawDuelPanel(8,   16, 148, 148, duelLeft,  leftActive,  kMint);
+  if (!rightOk) drawDuelPanel(164, 16, 148, 148, duelRight, rightActive, kHot);
+
+  // 发言者边框高亮（叠在动画上方）
+  M5.Display.drawRoundRect(8,   16, 148, 148, 8, leftActive  ? kMint : kDim);
+  M5.Display.drawRoundRect(164, 16, 148, 148, 8, rightActive ? kHot  : kDim);
+
+  // 名字标签（顶部半透明黑底，确保可读）
+  M5.Display.setTextSize(1);
+  M5.Display.fillRect(8,   16, 148, 18, 0x0000);
+  M5.Display.setTextColor(leftActive  ? kMint : kInk, 0x0000);
+  M5.Display.setCursor(18, 20);
+  M5.Display.print(duelLabel(duelLeft));
+  M5.Display.fillRect(164, 16, 148, 18, 0x0000);
+  M5.Display.setTextColor(rightActive ? kHot  : kInk, 0x0000);
+  M5.Display.setCursor(174, 20);
+  M5.Display.print(duelLabel(duelRight));
+
+  // 状态 + 对话文字（动画面板下方区域）
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(kAmber, TFT_BLACK);
+  M5.Display.setCursor(12, 174);
+  M5.Display.printf("state: %s", duelState.c_str());
+
+  if (duelText.length()) {
+    String shown = duelText;
+    if (shown.length() > 56) shown = shown.substring(0, 56);
+    M5.Display.fillRoundRect(8, 190, 304, 42, 8, 0x0841);
+    M5.Display.drawRoundRect(8, 190, 304, 42, 8, leftActive ? kMint : kHot);
+    M5.Display.setTextColor(kInk, 0x0841);
+    M5.Display.setCursor(18, 204);
+    M5.Display.print(shown);
+  }
+}
+
 void drawScreen() {
   if (debugOverlay) {
     drawDebugOverlay();
     return;
   }
-  if (videoMode && drawAnimFrame()) {
+  if (duelMode && millis() < duelUntilMs) {
+    drawDuelScreen();
     return;
   }
-  drawHeader();
-  drawList();
-  drawScanline();
+  if (duelMode && millis() >= duelUntilMs) {
+    duelMode = false;
+    // 关闭分屏动画目录，释放文件句柄
+    if (duelLeftAnimOpen)  { duelLeftAnimDir.close();  duelLeftAnimOpen  = false; }
+    if (duelRightAnimOpen) { duelRightAnimDir.close(); duelRightAnimOpen = false; }
+  }
+  if (videoMode) {
+    bool ok = drawAnimFrame();
+    if (!ok) {
+      M5.Display.fillScreen(kBg);
+      M5.Display.setTextSize(2);
+      M5.Display.setTextColor(kAmber, kBg);
+      M5.Display.setCursor(50, 110);
+      M5.Display.print("loading...");
+    }
+    return;
+  }
+  M5.Display.fillScreen(kBg);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(kAmber, kBg);
+  M5.Display.setCursor(40, 100);
+  M5.Display.print(sdReady ? "NO ANIMATION" : "NO SD CARD");
 }
 
 void scanNearby() {
@@ -1049,9 +1383,9 @@ void scanNearby() {
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
-  M5.Display.setRotation(1);
-  M5.Display.fillScreen(kBg);
-  M5.Speaker.setVolume(72);
+  M5.Display.setBrightness(128);
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Speaker.setVolume(0);
 
   Serial.begin(115200);
   delay(300);
@@ -1073,9 +1407,88 @@ void setup() {
   drawScreen();
 }
 
+// ======================
+// 串口协议（与 animation.ino 兼容，补充 BLE GATT）
+// ======================
+void handleSerialCommands() {
+  while (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+
+    // TXT|<state>|<text>  直接切换动画状态 + 显示文字
+    if (line.startsWith("TXT|")) {
+      int p1 = line.indexOf('|', 4);
+      String stateName = (p1 > 0) ? line.substring(4, p1) : line.substring(4);
+      String text = (p1 > 0) ? line.substring(p1 + 1) : "";
+      stateName.trim();
+      text.trim();
+
+      ActionState target;
+      if (actionFromName(stateName, &target)) {
+        transitionAction(target);
+        actionHoldUntilMs = millis() + (target == ACTION_COOLDOWN ? 4000 : 12000);   // 防本地 RSSI 覆盖
+        Serial.printf("SERIAL TXT: state=%s text='%s'\n", stateName.c_str(), text.c_str());
+      } else {
+        Serial.printf("SERIAL TXT: unknown state '%s'\n", stateName.c_str());
+      }
+
+      if (text.length()) {
+        lastAgentText = text;
+        lastAgentTextMs = millis();
+      }
+      continue;
+    }
+
+    // DUEL|<left>|<right>|<speaker>|<state>|<text>  双人分屏（预留）
+    if (line.startsWith("DUEL|")) {
+      int p1 = line.indexOf('|', 5);
+      int p2 = p1 > 0 ? line.indexOf('|', p1 + 1) : -1;
+      int p3 = p2 > 0 ? line.indexOf('|', p2 + 1) : -1;
+      int p4 = p3 > 0 ? line.indexOf('|', p3 + 1) : -1;
+      if (p1 > 0 && p2 > 0 && p3 > 0 && p4 > 0) {
+        duelLeft = line.substring(5, p1);
+        duelRight = line.substring(p1 + 1, p2);
+        duelSpeaker = line.substring(p2 + 1, p3);
+        duelState = line.substring(p3 + 1, p4);
+        duelText = line.substring(p4 + 1);
+        duelLeft.trim();
+        duelRight.trim();
+        duelSpeaker.trim();
+        duelState.trim();
+        duelText.trim();
+
+        ActionState target;
+        if (actionFromName(duelState, &target)) {
+          transitionAction(target);
+          actionHoldUntilMs = millis() + 12000;
+        }
+        if (duelText.length()) {
+          lastAgentText = duelText;
+          lastAgentTextMs = millis();
+        }
+        duelMode = true;
+        duelUntilMs = millis() + 12000;
+        // 重置分屏动画目录（人物或状态变化时重新打开）
+        if (duelLeftAnimOpen)  { duelLeftAnimDir.close();  duelLeftAnimOpen  = false; }
+        if (duelRightAnimOpen) { duelRightAnimDir.close(); duelRightAnimOpen = false; }
+        Serial.printf("SERIAL DUEL: %s | %s says '%s'\n",
+                      duelState.c_str(), duelSpeaker.c_str(), duelText.c_str());
+      } else {
+        Serial.printf("SERIAL DUEL malformed: %s\n", line.c_str());
+      }
+      continue;
+    }
+
+    Serial.printf("SERIAL: %s\n", line.c_str());
+  }
+}
+
 void loop() {
   M5.update();
   uint32_t now = millis();
+
+  handleSerialCommands();
 
   auto touch = M5.Touch.getDetail();
   if (touch.wasHold()) {
@@ -1106,10 +1519,13 @@ void loop() {
     drawScreen();
   }
 
-  if (videoMode && now - lastVideoMs > 120) {
+  if (now - lastVideoMs > 120) {
     lastVideoMs = now;
-    drawVideoFrame();
-    return;
+    if (duelMode && millis() < duelUntilMs) {
+      drawDuelScreen();              // 分屏模式：左右各读下一帧
+    } else if (videoMode) {
+      drawAnimFrame();               // 单人模式：读本地 persona 帧
+    }
   }
 
   if (!videoMode && advertiser && now - lastAdvertiseUpdateMs > 10000) {
