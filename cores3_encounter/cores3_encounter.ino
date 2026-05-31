@@ -96,6 +96,10 @@ String duelSpeaker;
 String duelText;
 String duelState;
 uint32_t duelUntilMs = 0;
+bool autoDuelEnabled = true;       // BLE 探测到对方时自动进入并保持分屏
+uint32_t serialDuelUntilMs = 0;    // 串口 DUEL 命令的优先窗口（此期间不被自动分屏覆盖）
+const uint32_t kPeerFreshMs = 12000;   // 对方多久没刷新就视为离开（退出分屏）
+const uint32_t kAutoDuelKeepMs = 8000; // 探测到对方时分屏保活时长（> 扫描间隔即可）
 uint32_t lastScanMs = 0;
 uint32_t lastDrawMs = 0;
 uint32_t lastSoundMs = 0;
@@ -415,6 +419,53 @@ void updateActionState() {
       break;
   }
   manualEncounterTrigger = false;
+}
+
+// 是否近期(kPeerFreshMs)探测到另一块项目板。
+// 注意：128-bit 服务 UUID 占满广播包，厂商数据(含 personaId)常被丢弃，
+// 所以不能依赖 peer.personaId；改用「项目板特征」判断：
+//   - projectPeer（成功解析到厂商数据时）或
+//   - BLE 名字以 REDNOTE- 开头（扫描响应里一定带名字）
+// 全项目仅两块板、两个固定人格，探测到对方即可确定分屏对为 xiao_hong|zhang_zong。
+bool duelPeerPresent() {
+  uint32_t now = millis();
+  for (const auto& item : encounters) {
+    if (now - item.lastSeenMs > kPeerFreshMs) continue;     // 太久没见 = 已离开
+    if (item.rssi < minShownRssi) continue;
+    if (item.projectPeer || item.name.startsWith(peerNamePrefix)) return true;
+  }
+  return false;
+}
+
+// BLE 自动分屏：只要持续探测到对方板，就进入并保持分屏；对方离开后自动退回单人。
+// 串口 DUEL 命令（后端驱动）在其 12s 窗口内优先，不被这里覆盖。
+void updateAutoDuel() {
+  if (!autoDuelEnabled) return;
+  uint32_t now = millis();
+  if (now < serialDuelUntilMs) return;                       // 让位给串口 DUEL
+
+  if (!duelPeerPresent()) return;                            // 没探测到对方：到点自动退出
+
+  bool wasDuel = duelMode;
+
+  // 固定布局：xiao_hong 在左、zhang_zong 在右（两块板画面一致）
+  duelLeft  = "xiao_hong";
+  duelRight = "zhang_zong";
+  duelText  = "";                                            // 自动模式无对白
+
+  // 状态随距离变化：很近=chat，较近=meet，否则=outdoor(正在靠近)
+  PeerState ps = localPeerState();
+  duelState = (ps == PEER_SOCIAL) ? "chat" : (ps == PEER_VISITING) ? "meet" : "outdoor";
+
+  // 发言者每 2.5s 交替，画面更像在对话
+  duelSpeaker = ((now / 2500) % 2 == 0) ? duelLeft : duelRight;
+
+  duelMode = true;
+  duelUntilMs = now + kAutoDuelKeepMs;                       // 持续探测到就一直续期
+
+  if (!wasDuel) {
+    Serial.printf("[auto-duel] peer detected -> split screen (state=%s)\n", duelState.c_str());
+  }
 }
 
 String buildProjectManufacturerData(PeerState state) {
@@ -1469,6 +1520,7 @@ void handleSerialCommands() {
         }
         duelMode = true;
         duelUntilMs = millis() + 12000;
+        serialDuelUntilMs = millis() + 12000;   // 串口命令优先窗口，期间不被自动分屏覆盖
         // 重置分屏动画目录（人物或状态变化时重新打开）
         if (duelLeftAnimOpen)  { duelLeftAnimDir.close();  duelLeftAnimOpen  = false; }
         if (duelRightAnimOpen) { duelRightAnimDir.close(); duelRightAnimOpen = false; }
@@ -1536,6 +1588,7 @@ void loop() {
     lastScanMs = now;
     scanNearby();
     updateActionState();
+    updateAutoDuel();
     bool repeated = activeRepeatedCount() > 0;
     if (currentAction != ACTION_THINKING && currentAction != ACTION_COOLDOWN) {
       playMinionishSound(bestRssi(), repeated);
@@ -1546,6 +1599,7 @@ void loop() {
   if (now - lastDrawMs > 1000) {
     lastDrawMs = now;
     updateActionState();
+    updateAutoDuel();
     drawScreen();
   }
 }
