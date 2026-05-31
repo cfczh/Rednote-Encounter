@@ -100,6 +100,7 @@ bool autoDuelEnabled = true;       // BLE 探测到对方时自动进入并保�
 uint32_t serialDuelUntilMs = 0;    // 串口 DUEL 命令的优先窗口（此期间不被自动分屏覆盖）
 const uint32_t kPeerFreshMs = 12000;   // 对方多久没刷新就视为离开（退出分屏）
 const uint32_t kAutoDuelKeepMs = 8000; // 探测到对方时分屏保活时长（> 扫描间隔即可）
+const size_t kMaxFrameBytes = 2000000; // 单帧最大字节(走 PSRAM)；超大图建议缩图以保流畅
 uint32_t lastScanMs = 0;
 uint32_t lastDrawMs = 0;
 uint32_t lastSoundMs = 0;
@@ -465,6 +466,8 @@ void updateAutoDuel() {
 
   if (!wasDuel) {
     Serial.printf("[auto-duel] peer detected -> split screen (state=%s)\n", duelState.c_str());
+    diagPersonaFrames("xiao_hong", duelState);
+    diagPersonaFrames("zhang_zong", duelState);
   }
 }
 
@@ -834,6 +837,51 @@ bool openDuelAnimDir(File& dir, bool& dirOpen, String& openPersona, String& open
   return true;
 }
 
+// 诊断：报告某 persona 当前状态目录里有几张图、首张多大、是否有超 140KB 的帧。
+// 仅在进入分屏时打印一次，用于定位「右侧为何回退占位符」。
+void diagPersonaFrames(const String& persona, const String& state) {
+  char path[80];
+  bool fellBack = false;
+  snprintf(path, sizeof(path), "/%s/animations/%s", persona.c_str(), state.c_str());
+  File d = SD.open(path);
+  if (!d || !d.isDirectory()) {
+    if (d) d.close();
+    snprintf(path, sizeof(path), "/%s/animations/idle", persona.c_str());
+    d = SD.open(path);
+    fellBack = true;
+  }
+  if (!d || !d.isDirectory()) {
+    if (d) d.close();
+    Serial.printf("[diag] %s/%s : DIR MISSING (idle 回退也没有)\n", persona.c_str(), state.c_str());
+    return;
+  }
+  int imgs = 0, oversize = 0;
+  size_t firstSize = 0;
+  String firstName = "";
+  int guard = 0;
+  while (guard < 200) {
+    File f = d.openNextFile();
+    if (!f) break;
+    guard++;
+    String nm = f.name();
+    if (!nm.startsWith(".")) {
+      bool img = nm.endsWith(".png") || nm.endsWith(".PNG") ||
+                 nm.endsWith(".jpg") || nm.endsWith(".JPG") ||
+                 nm.endsWith(".jpeg") || nm.endsWith(".JPEG");
+      if (img) {
+        if (imgs == 0) { firstSize = f.size(); firstName = nm; }
+        if (f.size() == 0 || f.size() > 140000) oversize++;
+        imgs++;
+      }
+    }
+    f.close();
+  }
+  d.close();
+  Serial.printf("[diag] %s%s : %d 张图, 超限(>140KB或0)=%d, 首张=%s(%uB)\n",
+                path, fellBack ? "(idle回退)" : "", imgs, oversize,
+                firstName.c_str(), (unsigned)firstSize);
+}
+
 // 读取并绘制指定 persona 的下一帧，绘制区域限定在 (x, y, w, h)
 // 帧取完自动回绕；状态/人物变化时自动重开目录
 bool drawDuelPersonaFrame(File& dir, bool& dirOpen, String& openPersona, String& openState,
@@ -864,8 +912,10 @@ bool drawDuelPersonaFrame(File& dir, bool& dirOpen, String& openPersona, String&
   }
   if (tries >= 60) return false;
   size_t size = file.size();
-  if (size == 0 || size > 140000) { file.close(); return false; }
-  uint8_t* buf = (uint8_t*)malloc(size);
+  if (size == 0 || size > kMaxFrameBytes) { file.close(); return false; }
+  // 优先从 PSRAM 分配（大图如张总 ~950KB 内部 RAM 放不下），失败再退普通堆
+  uint8_t* buf = (uint8_t*)ps_malloc(size);
+  if (!buf) buf = (uint8_t*)malloc(size);
   if (!buf) { file.close(); return false; }
   size_t readLen = file.read(buf, size);
   file.close();
@@ -910,10 +960,10 @@ bool drawAnimFrame() {
   if (tries >= 60) return false; // 目录里没有图片文件
 
   size_t size = file.size();
-  const size_t kMaxFrame = 140000;
-  if (size == 0 || size > kMaxFrame) { file.close(); return false; }
+  if (size == 0 || size > kMaxFrameBytes) { file.close(); return false; }
 
-  uint8_t* buf = (uint8_t*)malloc(size);
+  uint8_t* buf = (uint8_t*)ps_malloc(size);
+  if (!buf) buf = (uint8_t*)malloc(size);
   if (!buf) { file.close(); return false; }
   size_t readLen = file.read(buf, size);
   file.close();
@@ -1392,6 +1442,7 @@ void drawScreen() {
     return;
   }
   if (duelMode && millis() < duelUntilMs) {
+    if (animDirOpen) { animDir.close(); animDirOpen = false; }  // 释放单人模式句柄，避免与分屏双目录争用
     drawDuelScreen();
     return;
   }
