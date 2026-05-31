@@ -399,6 +399,21 @@ def serial_payload_for(payload: str) -> str:
     return build_serial_txt("chat", payload)
 
 
+async def send_duel(left: Peer, right: Peer, speaker: str = "", state: str = "chat", text: str = "") -> None:
+    """双人分屏命令：WS 优先发给两块板子，串口兜底"""
+    payload = build_serial_duel(left.persona, right.persona, speaker, state, text)
+    # WS 优先
+    ws_ok_l = await ws_send_board(left.persona, payload)
+    ws_ok_r = await ws_send_board(right.persona, payload)
+    if ws_ok_l and ws_ok_r:
+        return
+    # 串口兜底
+    if not ws_ok_l:
+        _send_serial(left.persona, payload)
+    if not ws_ok_r:
+        _send_serial(right.persona, payload)
+
+
 def send_duel_serial(left: Peer, right: Peer, speaker: str = "", state: str = "chat", text: str = "") -> None:
     payload = build_serial_duel(left.persona, right.persona, speaker, state, text)
     _send_serial(left.persona, payload)
@@ -423,13 +438,18 @@ async def send_to_device(address: str, payload: str) -> bool:
 
 
 async def send_to_peer(peer: Peer, payload: str) -> bool:
-    """串口优先，BLE 兜底"""
+    """WS 优先 → 串口 → BLE GATT 兜底"""
+    # 1) WebSocket (板子连了 WiFi)
+    if await ws_send_board(peer.persona, payload):
+        return True
+    # 2) 串口
     serial_ok = False
     if peer.persona in SERIAL_PORTS:
         serial_ok = _send_serial(peer.persona, serial_payload_for(payload))
     if serial_ok:
         print(f"  -> {peer.persona} via serial: {payload[:40]}")
         return True
+    # 3) BLE GATT
     return await send_to_device(peer.address, payload)
 
 
@@ -456,12 +476,14 @@ def serial_virtual_peers(now: float) -> list[Peer]:
 
 
 # ======================================================================
-# 4. WebSocket 服务器（可选，调试 / 未来板子 WiFi 通道）
-#    没装 websockets 库时自动跳过，不影响 BLE 主链路。
+# 4. WebSocket 服务器（板子 WiFi 通道 + dashboard 监控）
+#    板子连上来发 HELLO|<persona> 注册身份，之后收 TXT|/DUEL| 命令。
+#    dashboard.html 连上来纯监听 JSON 事件广播。
 # ======================================================================
 
 WS_PORT = 8765
-WS_CLIENTS: set = set()
+WS_BOARDS: dict[str, object] = {}       # persona → websocket (板子)
+WS_DASHBOARDS: set = set()              # dashboard.html 客户端
 
 
 async def start_ws_server() -> object:
@@ -472,31 +494,70 @@ async def start_ws_server() -> object:
         return None
 
     async def handler(ws):
-        WS_CLIENTS.add(ws)
+        persona = None
         try:
+            async for raw in ws:
+                msg = raw.strip()
+                if msg.startswith("HELLO|"):
+                    persona = msg[6:].strip() or "unknown"
+                    WS_BOARDS[persona] = ws
+                    print(f"[ws] 板子上线: {persona}  (在线: {', '.join(WS_BOARDS) or '无'})")
+                    break                          # HELLO 注册完就不再等消息
+                else:
+                    WS_DASHBOARDS.add(ws)          # 非 HELLO → 视为 dashboard
+                    await ws_broadcast_status()    # 新 dashboard 连上立即推送一次状态
+            # 保持连接不超时
             async for _ in ws:
                 pass
+        except Exception:
+            pass
         finally:
-            WS_CLIENTS.discard(ws)
+            if persona and WS_BOARDS.get(persona) is ws:
+                del WS_BOARDS[persona]
+                print(f"[ws] 板子下线: {persona}")
+            WS_DASHBOARDS.discard(ws)
 
     server = await websockets.serve(handler, "0.0.0.0", WS_PORT)
     print(f"WebSocket server on ws://0.0.0.0:{WS_PORT}")
     return server
 
 
+async def ws_send_board(persona: str, cmd: str) -> bool:
+    """通过 WebSocket 向指定 persona 的板子发命令。成功返回 True。"""
+    ws = WS_BOARDS.get(persona)
+    if not ws:
+        return False
+    try:
+        await ws.send(cmd)
+        print(f"  -> {persona} via WS: {cmd[:50]}")
+        return True
+    except Exception as exc:
+        print(f"  WS send failed -> {persona}: {exc}")
+        WS_BOARDS.pop(persona, None)
+        return False
+
+
 async def ws_broadcast(obj: dict) -> None:
-    if not WS_CLIENTS:
+    """向所有 dashboard 客户端广播 JSON 事件。"""
+    if not WS_DASHBOARDS:
         return
     import json
     msg = json.dumps(obj, ensure_ascii=False)
     dead = []
-    for ws in list(WS_CLIENTS):
+    for ws in list(WS_DASHBOARDS):
         try:
             await ws.send(msg)
         except Exception:
             dead.append(ws)
     for ws in dead:
-        WS_CLIENTS.discard(ws)
+        WS_DASHBOARDS.discard(ws)
+
+
+async def ws_broadcast_status() -> None:
+    """广播当前所有在线板子状态给 dashboard。"""
+    from json import dumps
+    board_list = list(WS_BOARDS.keys())
+    await ws_broadcast({"type": "ws_status", "boards": board_list})
 
 
 # ======================================================================
@@ -622,10 +683,10 @@ async def main() -> None:
                                             "b": f"{b.device_id:04X}", "b_persona": b.persona,
                                             "affinity": session.affinity,
                                             "mode": session.mode})
-                        # 通知两台板子播对应相遇动画（串口 + BLE 双通道）
+                        # 通知两台板子播对应相遇动画（WS + 串口 + BLE 三通道）
                         await send_to_peer(a, CMD_OUTDOOR)
                         await send_to_peer(b, CMD_OUTDOOR)
-                        send_duel_serial(a, b, "", "outdoor", "")
+                        await send_duel(a, b, "", "outdoor", "")
                     elif both_social and not cooled:
                         print(f"  Skip pair: cooldown {int(PAIR_COOLDOWN-(now-session.ended_at))}s")
 
@@ -673,8 +734,8 @@ async def main() -> None:
                                                 "device": f"{self_peer.device_id:04X}",
                                                 "persona": self_peer.persona,
                                                 "turn": session.turns, "text": reply})
-                            send_duel_serial(a, b, self_peer.persona, "chat", reply)
-                            if self_peer.persona not in SERIAL_PORTS:
+                            await send_duel(a, b, self_peer.persona, "chat", reply)
+                            if self_peer.persona not in SERIAL_PORTS and self_peer.persona not in WS_BOARDS:
                                 await send_to_peer(self_peer, reply)
 
             await asyncio.sleep(0.6)

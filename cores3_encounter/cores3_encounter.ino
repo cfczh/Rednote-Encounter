@@ -19,9 +19,9 @@
 // 填好下面 4 项后即启用：板子作为 WS 客户端连后端服务器，接收与串口
 // 完全相同的 TXT|/DUEL|/#ACT 命令。WIFI_SSID 留空("")则完全不启动 WiFi，
 // 行为与纯 BLE+串口一致（不影响现有自动分屏）。串口始终保留作调试/回退。
-#define WIFI_SSID ""                     // ← 填你的 WiFi 名
-#define WIFI_PASS ""                     // ← 填你的 WiFi 密码
-#define WS_HOST   "192.168.1.100"        // ← 后端电脑的局域网 IP
+#define WIFI_SSID "iphone"               // ← 填你的 WiFi 名
+#define WIFI_PASS "12345678"             // ← 填你的 WiFi 密码
+#define WS_HOST   "172.20.10.8"          // ← 后端电脑的局域网 IP
 #define WS_PORT   8765
 #define WS_PATH   "/"
 
@@ -1636,17 +1636,16 @@ void handleSerialCommands() {
 }
 
 // ====== WebSocket 命令通道（板子作为客户端连后端 WS 服务器）======
-using namespace websockets;
-WebsocketsClient wsClient;
+websockets::WebsocketsClient wsClient;
 bool wsEnabled = false;
 uint32_t lastWsAttemptMs = 0;
 
-void onWsMessage(WebsocketsMessage message) {
-  processCommandLine(message.data());   // WS 与串口走同一套命令解析
+void onWsMessage(websockets::WebsocketsMessage message) {
+  processCommandLine(message.data());
 }
 
-void onWsEvent(WebsocketsEvent event, String data) {
-  if (event == WebsocketsEvent::ConnectionClosed) {
+void onWsEvent(websockets::WebsocketsEvent event, String data) {
+  if (event == websockets::WebsocketsEvent::ConnectionClosed) {
     Serial.println("[ws] connection closed");
   }
 }
@@ -1674,12 +1673,18 @@ void wsLoop() {
   uint32_t now = millis();                       // 未连：每 5s 重试
   if (now - lastWsAttemptMs < 5000) return;
   lastWsAttemptMs = now;
-  if (WiFi.status() != WL_CONNECTED) return;     // 等 WiFi 就绪
+
+  wl_status_t st = WiFi.status();
+  Serial.printf("[ws] WiFi status=%d (SSID=%s)\n", (int)st, WiFi.SSID().c_str());
+  if (st != WL_CONNECTED) return;               // 等 WiFi 就绪
+
   String url = String("ws://") + WS_HOST + ":" + String(WS_PORT) + WS_PATH;
   Serial.printf("[ws] 连接服务器 %s\n", url.c_str());
   if (wsClient.connect(url)) {
     Serial.println("[ws] 已连接");
-    wsClient.send(String("HELLO|") + localPersona.codeName);  // 告知后端本机人格
+    wsClient.send(String("HELLO|") + localPersona.codeName);
+  } else {
+    Serial.println("[ws] 连接失败");
   }
 }
 
